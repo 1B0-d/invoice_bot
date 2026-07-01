@@ -10,11 +10,11 @@ export async function extractWithOpenAI(
   mimeType: string,
   runtimeConfig: AiRuntimeConfig = {}
 ): Promise<ExtractedInvoice> {
-  const apiKey = runtimeConfig.openaiApiKey || process.env.OPENAI_API_KEY;
+  const apiKey = runtimeConfig.openaiApiKey;
   const model = runtimeConfig.openaiModel || process.env.OPENAI_MODEL || 'gpt-5.2';
 
   if (!apiKey) {
-    throw new Error('OPENAI_API_KEY is missing in .env');
+    throw new Error('OPENAI_API_KEY is not configured for this user');
   }
 
   const client = new OpenAI({ apiKey });

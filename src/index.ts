@@ -46,20 +46,20 @@ function getUserId(ctx: BotContext) {
   const userId = ctx.from?.id;
 
   if (!userId) {
-    throw new Error('Не удалось определить пользователя Telegram.');
+    throw new Error('Could not determine Telegram user.');
   }
 
   return String(userId);
 }
 
 function maskSecret(value?: string) {
-  if (!value) return 'не задан';
+  if (!value) return 'not set';
   if (value.length <= 8) return `${value.slice(0, 2)}***${value.slice(-2)}`;
   return `${value.slice(0, 4)}***${value.slice(-4)}`;
 }
 
 function maskSheetId(value?: string) {
-  if (!value) return 'не задан';
+  if (!value) return 'not set';
   if (value.length <= 10) return `${value.slice(0, 3)}***${value.slice(-3)}`;
   return `${value.slice(0, 6)}***${value.slice(-6)}`;
 }
@@ -79,20 +79,21 @@ function getColumnMappingForUser(settings: UserSettings) {
 function buildSettingsKeyboard() {
   return Markup.inlineKeyboard([
     [
-      Markup.button.callback('Провайдер AI', 'settings:provider'),
+      Markup.button.callback('AI provider', 'settings:provider'),
       Markup.button.callback('Sheet ID', 'settings:sheet'),
     ],
     [
       Markup.button.callback('Sheet name', 'settings:sheet_name'),
-      Markup.button.callback('Колонки', 'settings:columns'),
+      Markup.button.callback('Columns', 'settings:columns'),
     ],
+    [Markup.button.callback('Columns help', 'settings:columns_help')],
     [
       Markup.button.callback('Gemini API key', 'settings:gemini_key'),
       Markup.button.callback('OpenAI API key', 'settings:openai_key'),
     ],
     [
-      Markup.button.callback('Показать настройки', 'settings:show'),
-      Markup.button.callback('Закрыть', 'settings:close'),
+      Markup.button.callback('Show settings', 'settings:show'),
+      Markup.button.callback('Close', 'settings:close'),
     ],
   ]);
 }
@@ -105,8 +106,8 @@ function buildProviderKeyboard(currentProvider: AiProvider) {
       Markup.button.callback(currentProvider === 'mock' ? 'Mock *' : 'Mock', 'provider:mock'),
     ],
     [
-      Markup.button.callback('Назад', 'settings:menu'),
-      Markup.button.callback('Закрыть', 'settings:close'),
+      Markup.button.callback('Back', 'settings:menu'),
+      Markup.button.callback('Close', 'settings:close'),
     ],
   ]);
 }
@@ -129,32 +130,57 @@ async function buildSettingsSummary(userId: string) {
   const provider = settings.provider || getAiProvider();
 
   return (
-    `Текущие настройки:\n` +
-    `Провайдер AI: ${provider}\n` +
+    `Current settings:\n` +
+    `AI provider: ${provider}\n` +
     `Gemini key: ${maskSecret(settings.geminiApiKey)}\n` +
     `OpenAI key: ${maskSecret(settings.openaiApiKey)}\n` +
     `Google Sheet ID: ${maskSheetId(getSheetIdForUser(settings))}\n` +
-    `Sheet name: ${getSheetNameForUser(settings) || 'не задан'}\n` +
-    `Колонки:\n${formatColumnMapping(settings.columnMapping)}`
+    `Sheet name: ${getSheetNameForUser(settings) || 'not set'}\n` +
+    `Columns:\n${formatColumnMapping(settings.columnMapping)}`
   );
+}
+
+function getProviderSetupError(provider: AiProvider, settings: UserSettings) {
+  if (provider === 'gemini' && !settings.geminiApiKey) {
+    return 'For Gemini, first set your Gemini API key in /settings.';
+  }
+
+  if (provider === 'openai' && !settings.openaiApiKey) {
+    return 'For OpenAI, first set your OpenAI API key in /settings.';
+  }
+
+  return null;
 }
 
 async function showSettingsMenu(ctx: BotContext, text?: string) {
   ctx.session.awaitingInput = undefined;
   const message = text || (await buildSettingsSummary(getUserId(ctx)));
-  await ctx.reply(`${message}\n\nВыбери, что хочешь настроить:`, buildSettingsKeyboard());
+  await ctx.reply(`${message}\n\nChoose what you want to configure:`, buildSettingsKeyboard());
 }
 
 async function promptForInput(ctx: BotContext, mode: AwaitingInputMode, prompt: string) {
   ctx.session.awaitingInput = mode;
-  await ctx.reply(`${prompt}\n\nМожно написать "назад" или /cancel.`);
+  await ctx.reply(`${prompt}\n\nYou can type "back" or /cancel.`);
+}
+
+function getColumnMappingHelpText() {
+  return (
+    `How column mapping works:\n\n` +
+    `On the left is the bot field, on the right is the Google Sheets column letter.\n` +
+    `Example: supplier=C means "write supplier to column C".\n\n` +
+    `Available fields:\n` +
+    `uploaded_at\ninvoice_date\nsupplier\nitem\nquantity\nunit\nunit_price\ntotal_price\ncurrency\ninvoice_number\nsource\n\n` +
+    `Example mapping:\n` +
+    `uploaded_at=A\ninvoice_date=B\nsupplier=C\nitem=D\nquantity=E\nunit=F\nunit_price=G\ntotal_price=H\ncurrency=I\ninvoice_number=J\nsource=K\n\n` +
+    `You can specify only the fields you want to remap. The rest stay on defaults.`
+  );
 }
 
 function buildSheetWriteOptions(settings: UserSettings) {
   const spreadsheetId = getSheetIdForUser(settings);
 
   if (!spreadsheetId) {
-    throw new Error('Сначала укажи Google Sheet ID в /settings.');
+    throw new Error('First set Google Sheet ID in /settings.');
   }
 
   const options = {
@@ -177,17 +203,17 @@ function buildSheetWriteOptions(settings: UserSettings) {
 function validateInvoiceForWrite(invoice: ExtractedInvoice) {
   const errors: string[] = [];
 
-  if (!invoice.supplier.trim()) errors.push('Не найден поставщик');
+  if (!invoice.supplier.trim()) errors.push('Supplier was not detected');
   if (!/^\d{4}-\d{2}-\d{2}$/.test(invoice.invoice_date)) {
-    errors.push('Дата счета отсутствует или имеет неверный формат');
+    errors.push('Invoice date is missing or has invalid format');
   }
-  if (!invoice.items.length) errors.push('Не найдены позиции в документе');
+  if (!invoice.items.length) errors.push('No line items were detected');
 
   for (const item of invoice.items) {
-    if (!item.name.trim()) errors.push('У одной из позиций нет названия');
-    if (item.quantity <= 0) errors.push(`Некорректное количество у позиции: ${item.name || 'без названия'}`);
-    if (item.unit_price <= 0) errors.push(`Некорректная цена у позиции: ${item.name || 'без названия'}`);
-    if (item.total_price <= 0) errors.push(`Некорректная сумма у позиции: ${item.name || 'без названия'}`);
+    if (!item.name.trim()) errors.push('One of the items has no name');
+    if (item.quantity <= 0) errors.push(`Invalid quantity for item: ${item.name || 'unnamed item'}`);
+    if (item.unit_price <= 0) errors.push(`Invalid unit price for item: ${item.name || 'unnamed item'}`);
+    if (item.total_price <= 0) errors.push(`Invalid total price for item: ${item.name || 'unnamed item'}`);
   }
 
   return errors;
@@ -229,29 +255,56 @@ async function processInvoiceFile(ctx: BotContext, fileId: string, filename: str
   const sheetName = getSheetNameForUser(settings);
 
   if (!spreadsheetId) {
-    await ctx.reply('Сначала открой /settings и укажи Google Sheet ID.');
+    await ctx.reply('First open /settings and set Google Sheet ID.');
     return;
   }
 
-  await ctx.reply(`Файл получил. Скачиваю и обрабатываю через ${provider}...`);
+  const providerSetupError = getProviderSetupError(provider, settings);
+
+  if (providerSetupError) {
+    await ctx.reply(providerSetupError);
+    return;
+  }
+
+  await ctx.reply(`File received. Downloading and processing with ${provider}...`);
 
   const filePath = await downloadTelegramFile(bot, fileId, filename);
-  const invoice = await extractInvoiceFromFile(filePath, filename, mimeType, runtimeConfig);
+  let invoice: ExtractedInvoice;
+
+  try {
+    invoice = await extractInvoiceFromFile(filePath, filename, mimeType, runtimeConfig);
+  } catch (error) {
+    const message = String(error);
+
+    if (message.includes('not configured for this user')) {
+      await ctx.reply(providerSetupError || 'First set your API key in /settings.');
+      return;
+    }
+
+    if (message.includes('"status":"UNAVAILABLE"') || message.includes('high demand')) {
+      await ctx.reply(
+        `The ${provider} service is temporarily overloaded. Try again later or switch AI provider in /settings.`
+      );
+      return;
+    }
+
+    throw error;
+  }
 
   if (!invoice.is_invoice) {
     await ctx.reply(
-      `Это не похоже на счет или накладную.\n` +
-        `Тип документа: ${invoice.document_type || 'неизвестно'}\n` +
-        `В Google Sheets ничего не записал.`
+      `This does not look like an invoice.\n` +
+        `Document type: ${invoice.document_type || 'unknown'}\n` +
+        `Nothing was written to Google Sheets.`
     );
     return;
   }
 
   if (invoice.confidence < 0.6) {
     await ctx.reply(
-      `Документ распознан с низкой уверенностью.\n` +
+      `The document was recognized with low confidence.\n` +
         `Confidence: ${invoice.confidence}\n` +
-        `В Google Sheets ничего не записал.`
+        `Nothing was written to Google Sheets.`
     );
     return;
   }
@@ -260,7 +313,7 @@ async function processInvoiceFile(ctx: BotContext, fileId: string, filename: str
 
   if (validationErrors.length > 0) {
     await ctx.reply(
-      `Я нашел данные, похожие на счет, но пока небезопасно записывать их в таблицу.\n` +
+      `I found invoice-like data, but it is not safe to write yet.\n` +
         `${validationErrors.map((error) => `- ${error}`).join('\n')}`
     );
     return;
@@ -274,16 +327,16 @@ async function processInvoiceFile(ctx: BotContext, fileId: string, filename: str
     .join('\n');
 
   await ctx.reply(
-    `Готово. Строк добавлено в Google Sheets: ${invoice.items.length}\n\n` +
-      `Провайдер: ${provider}\n` +
-      `Поставщик: ${invoice.supplier}\n` +
-      `Дата: ${invoice.invoice_date}\n` +
-      `Счет: ${invoice.invoice_number}\n` +
-      `Таблица: ${maskSheetId(spreadsheetId)}\n` +
-      `Лист: ${sheetName || 'по умолчанию'}\n\n` +
+    `Done. Rows added to Google Sheets: ${invoice.items.length}\n\n` +
+      `Provider: ${provider}\n` +
+      `Supplier: ${invoice.supplier}\n` +
+      `Date: ${invoice.invoice_date}\n` +
+      `Invoice: ${invoice.invoice_number}\n` +
+      `Sheet ID: ${maskSheetId(spreadsheetId)}\n` +
+      `Sheet name: ${sheetName || 'default'}\n\n` +
       `${preview}` +
       (invoice.warnings.length
-        ? `\n\nПредупреждения:\n${invoice.warnings.map((item) => `- ${item}`).join('\n')}`
+        ? `\n\nWarnings:\n${invoice.warnings.map((item) => `- ${item}`).join('\n')}`
         : '')
   );
 }
@@ -297,12 +350,12 @@ async function handleTextInput(ctx: BotContext) {
   const rawText = ctx.message.text.trim();
 
   if (!rawText) {
-    await ctx.reply('Пустое значение не подходит. Попробуй еще раз или напиши "назад".');
+    await ctx.reply('Empty value is not allowed. Try again or type "back".');
     return true;
   }
 
-  if (rawText.toLowerCase() === 'назад' || rawText === '/cancel') {
-    await showSettingsMenu(ctx, 'Настройка отменена.');
+  if (rawText.toLowerCase() === 'back' || rawText.toLowerCase() === 'назад' || rawText === '/cancel') {
+    await showSettingsMenu(ctx, 'Configuration canceled.');
     return true;
   }
 
@@ -310,13 +363,13 @@ async function handleTextInput(ctx: BotContext) {
 
   if (mode === 'sheet_id') {
     await updateUserSettings(userId, { googleSheetId: rawText });
-    await showSettingsMenu(ctx, 'Google Sheet ID сохранен.');
+    await showSettingsMenu(ctx, 'Google Sheet ID saved.');
     return true;
   }
 
   if (mode === 'sheet_name') {
     await updateUserSettings(userId, { googleSheetName: rawText });
-    await showSettingsMenu(ctx, 'Sheet name сохранен.');
+    await showSettingsMenu(ctx, 'Sheet name saved.');
     return true;
   }
 
@@ -324,11 +377,11 @@ async function handleTextInput(ctx: BotContext) {
     try {
       const columnMapping = parseColumnMappingInput(rawText);
       await updateUserSettings(userId, { columnMapping });
-      await showSettingsMenu(ctx, 'Маппинг колонок сохранен.');
+      await showSettingsMenu(ctx, 'Column mapping saved.');
     } catch (error) {
       await ctx.reply(
-        `Не удалось разобрать маппинг: ${String(error)}\n\n` +
-          `Пример:\n` +
+        `Could not parse mapping: ${String(error)}\n\n` +
+          `Example:\n` +
           `supplier=C\ninvoice_date=B\nitem=F`
       );
     }
@@ -337,18 +390,18 @@ async function handleTextInput(ctx: BotContext) {
 
   if (mode === 'gemini_api_key') {
     await updateUserSettings(userId, { geminiApiKey: rawText });
-    await showSettingsMenu(ctx, 'Gemini API key сохранен.');
+    await showSettingsMenu(ctx, 'Gemini API key saved.');
     return true;
   }
 
   await updateUserSettings(userId, { openaiApiKey: rawText });
-  await showSettingsMenu(ctx, 'OpenAI API key сохранен.');
+  await showSettingsMenu(ctx, 'OpenAI API key saved.');
   return true;
 }
 
 bot.start(async (ctx) => {
   await ctx.reply(
-    'Пришли PDF, JPG или PNG со счетом. Я распознаю позиции и запишу их в Google Sheets.\n\nДля личных настроек открой /settings.'
+    'Send PDF, JPG, or PNG with an invoice. I will extract line items and write them to Google Sheets.\n\nOpen /settings for personal configuration.'
   );
 });
 
@@ -358,11 +411,11 @@ bot.command('settings', async (ctx) => {
 
 bot.command('cancel', async (ctx) => {
   if (!ctx.session.awaitingInput) {
-    await ctx.reply('Сейчас нечего отменять.');
+    await ctx.reply('There is nothing to cancel right now.');
     return;
   }
 
-  await showSettingsMenu(ctx, 'Действие отменено.');
+  await showSettingsMenu(ctx, 'Action canceled.');
 });
 
 bot.command('status', async (ctx) => {
@@ -371,16 +424,16 @@ bot.command('status', async (ctx) => {
   const settings = await getUserSettings(userId);
 
   await ctx.reply(
-    `Бот работает.\n` +
-      `Провайдер AI: ${getAiProvider(runtimeConfig)}\n` +
+    `Bot is running.\n` +
+      `AI provider: ${getAiProvider(runtimeConfig)}\n` +
       `Google Sheet ID: ${maskSheetId(getSheetIdForUser(settings))}\n` +
-      `Sheet name: ${getSheetNameForUser(settings) || 'не задан'}`
+      `Sheet name: ${getSheetNameForUser(settings) || 'not set'}`
   );
 });
 
 bot.command('provider', async (ctx) => {
   const runtimeConfig = await getRuntimeConfigForUser(getUserId(ctx));
-  await ctx.reply(`Текущий провайдер AI: ${getAiProvider(runtimeConfig)}`);
+  await ctx.reply(`Current AI provider: ${getAiProvider(runtimeConfig)}`);
 });
 
 bot.command('test', async (ctx) => {
@@ -388,7 +441,7 @@ bot.command('test', async (ctx) => {
     const settings = await getUserSettings(getUserId(ctx));
 
     if (!getSheetIdForUser(settings)) {
-      await ctx.reply('Сначала открой /settings и укажи Google Sheet ID.');
+      await ctx.reply('First open /settings and set Google Sheet ID.');
       return;
     }
 
@@ -396,10 +449,10 @@ bot.command('test', async (ctx) => {
       {
         uploaded_at: new Date().toISOString(),
         invoice_date: '2026-05-12',
-        supplier: 'ТОО Test Supplier',
-        item: 'Опора металлическая',
+        supplier: 'TOO Test Supplier',
+        item: 'Metal support',
         quantity: 10,
-        unit: 'шт',
+        unit: 'pcs',
         unit_price: 14500,
         total_price: 145000,
         currency: 'KZT',
@@ -409,10 +462,10 @@ bot.command('test', async (ctx) => {
       buildSheetWriteOptions(settings)
     );
 
-    await ctx.reply('Тестовая строка добавлена в Google Sheets.');
+    await ctx.reply('Test row was added to Google Sheets.');
   } catch (err) {
     console.error(err);
-    await ctx.reply(`Не удалось записать в Google Sheets: ${String(err)}`);
+    await ctx.reply(`Failed to write to Google Sheets: ${String(err)}`);
   }
 });
 
@@ -424,36 +477,42 @@ bot.action('settings:menu', async (ctx) => {
 bot.action('settings:provider', async (ctx) => {
   await ctx.answerCbQuery();
   const runtimeConfig = await getRuntimeConfigForUser(getUserId(ctx));
-  await ctx.reply('Выбери AI-провайдера:', buildProviderKeyboard(getAiProvider(runtimeConfig)));
+  await ctx.reply('Choose AI provider:', buildProviderKeyboard(getAiProvider(runtimeConfig)));
 });
 
 bot.action('settings:sheet', async (ctx) => {
   await ctx.answerCbQuery();
-  await promptForInput(ctx, 'sheet_id', 'Отправь Google Sheet ID для записи данных.');
+  await promptForInput(ctx, 'sheet_id', 'Send Google Sheet ID.');
 });
 
 bot.action('settings:sheet_name', async (ctx) => {
   await ctx.answerCbQuery();
-  await promptForInput(ctx, 'sheet_name', 'Отправь имя листа внутри таблицы. Например: Invoices');
+  await promptForInput(ctx, 'sheet_name', 'Send sheet name inside the spreadsheet. Example: Invoices');
 });
 
 bot.action('settings:columns', async (ctx) => {
   await ctx.answerCbQuery();
+  await ctx.reply(getColumnMappingHelpText());
   await promptForInput(
     ctx,
     'column_mapping',
-    'Отправь маппинг колонок строками в формате поле=колонка.\n\nПример:\nuploaded_at=A\ninvoice_date=B\nsupplier=C\nitem=D\nquantity=E'
+    'Now send your column mapping in the format field=column.\n\nExample:\nuploaded_at=A\ninvoice_date=B\nsupplier=C\nitem=D\nquantity=E'
   );
+});
+
+bot.action('settings:columns_help', async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.reply(getColumnMappingHelpText());
 });
 
 bot.action('settings:gemini_key', async (ctx) => {
   await ctx.answerCbQuery();
-  await promptForInput(ctx, 'gemini_api_key', 'Отправь свой Gemini API key.');
+  await promptForInput(ctx, 'gemini_api_key', 'Send your Gemini API key.');
 });
 
 bot.action('settings:openai_key', async (ctx) => {
   await ctx.answerCbQuery();
-  await promptForInput(ctx, 'openai_api_key', 'Отправь свой OpenAI API key.');
+  await promptForInput(ctx, 'openai_api_key', 'Send your OpenAI API key.');
 });
 
 bot.action('settings:show', async (ctx) => {
@@ -462,16 +521,16 @@ bot.action('settings:show', async (ctx) => {
 });
 
 bot.action('settings:close', async (ctx) => {
-  await ctx.answerCbQuery('Меню закрыто');
+  await ctx.answerCbQuery('Menu closed');
   ctx.session.awaitingInput = undefined;
-  await ctx.reply('Ок, вышел из меню настроек.');
+  await ctx.reply('Okay, settings menu closed.');
 });
 
 bot.action(/provider:(gemini|openai|mock)/, async (ctx) => {
   await ctx.answerCbQuery();
   const provider = ctx.match[1] as AiProvider;
   await updateUserSettings(getUserId(ctx), { provider });
-  await showSettingsMenu(ctx, `Провайдер переключен на ${provider}.`);
+  await showSettingsMenu(ctx, `Provider switched to ${provider}.`);
 });
 
 bot.on('text', async (ctx, next) => {
@@ -487,10 +546,10 @@ bot.on('document', async (ctx) => {
 
     if (!isSupportedInvoiceFile(filename, mimeType)) {
       await ctx.reply(
-        `Этот тип файла не поддерживается.\n\n` +
-          `Файл: ${filename}\n` +
-          `Тип: ${mimeType}\n\n` +
-          `Отправь только PDF, JPG или PNG.`
+        `This file type is not supported.\n\n` +
+          `File: ${filename}\n` +
+          `Type: ${mimeType}\n\n` +
+          `Send only PDF, JPG, or PNG.`
       );
       return;
     }
@@ -498,7 +557,7 @@ bot.on('document', async (ctx) => {
     await processInvoiceFile(ctx, document.file_id, filename, mimeType);
   } catch (err) {
     console.error(err);
-    await ctx.reply(`Ошибка при обработке документа: ${String(err)}`);
+    await ctx.reply(`Document processing error: ${String(err)}`);
   }
 });
 
@@ -508,7 +567,7 @@ bot.on('photo', async (ctx) => {
     const biggestPhoto = photos[photos.length - 1];
 
     if (!biggestPhoto) {
-      await ctx.reply('Фото не найдено в сообщении.');
+      await ctx.reply('Photo was not found in the message.');
       return;
     }
 
@@ -516,11 +575,19 @@ bot.on('photo', async (ctx) => {
     await processInvoiceFile(ctx, biggestPhoto.file_id, filename, 'image/jpeg');
   } catch (err) {
     console.error(err);
-    await ctx.reply(`Ошибка при обработке фото: ${String(err)}`);
+    await ctx.reply(`Photo processing error: ${String(err)}`);
   }
 });
 
 console.log(`Invoice bot started with default AI provider: ${getAiProvider()}`);
+
+await bot.telegram.setMyCommands([
+  { command: 'start', description: 'Start the bot' },
+  { command: 'settings', description: 'Configure AI and spreadsheet' },
+  { command: 'status', description: 'Check current settings' },
+  { command: 'provider', description: 'Show current AI provider' },
+  { command: 'test', description: 'Test writing to spreadsheet' },
+]);
 
 bot.launch();
 

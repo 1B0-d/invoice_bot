@@ -10,10 +10,10 @@ export async function extractWithGemini(
   mimeType: string,
   runtimeConfig: AiRuntimeConfig = {}
 ): Promise<ExtractedInvoice> {
-  const apiKey = runtimeConfig.geminiApiKey || process.env.GEMINI_API_KEY;
+  const apiKey = runtimeConfig.geminiApiKey;
 
   if (!apiKey) {
-    throw new Error('GEMINI_API_KEY is missing in .env');
+    throw new Error('GEMINI_API_KEY is not configured for this user');
   }
 
   const gemini = new GoogleGenAI({ apiKey });
