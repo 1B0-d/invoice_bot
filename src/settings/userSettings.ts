@@ -4,6 +4,8 @@ import path from 'node:path';
 import type { AiProvider } from '../ai/types.js';
 import { getSupabaseAdminClient } from '../lib/supabase.js';
 
+export type BotLanguage = 'ru' | 'kk' | 'en';
+
 export type InvoiceFieldKey =
   | 'uploaded_at'
   | 'invoice_date'
@@ -19,6 +21,7 @@ export type InvoiceFieldKey =
 
 export type UserSettings = {
   provider?: AiProvider;
+  language?: BotLanguage;
   geminiApiKey?: string;
   openaiApiKey?: string;
   googleSheetId?: string;
@@ -61,7 +64,7 @@ export async function getUserSettings(userId: string): Promise<UserSettings> {
     const { data, error } = await client
       .from(getUserSettingsTableName())
       .select(
-        'provider, gemini_api_key, openai_api_key, google_sheet_id, google_sheet_name, column_mapping'
+        'provider, language, gemini_api_key, openai_api_key, google_sheet_id, google_sheet_name, column_mapping'
       )
       .eq('telegram_user_id', userId)
       .maybeSingle();
@@ -76,6 +79,7 @@ export async function getUserSettings(userId: string): Promise<UserSettings> {
 
     const settings: UserSettings = {};
 
+    if (data.language) settings.language = data.language as BotLanguage;
     if (data.provider) settings.provider = data.provider;
     if (data.gemini_api_key) settings.geminiApiKey = data.gemini_api_key;
     if (data.openai_api_key) settings.openaiApiKey = data.openai_api_key;
@@ -106,6 +110,7 @@ export async function updateUserSettings(
       {
         telegram_user_id: userId,
         provider: next.provider ?? null,
+        language: next.language ?? null,
         gemini_api_key: next.geminiApiKey ?? null,
         openai_api_key: next.openaiApiKey ?? null,
         google_sheet_id: next.googleSheetId ?? null,

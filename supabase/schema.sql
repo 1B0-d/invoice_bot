@@ -1,6 +1,7 @@
 create table if not exists public.user_settings (
   telegram_user_id text primary key,
   provider text,
+  language text,
   gemini_api_key text,
   openai_api_key text,
   google_sheet_id text,
@@ -9,6 +10,8 @@ create table if not exists public.user_settings (
   created_at timestamptz not null default timezone('utc', now()),
   updated_at timestamptz not null default timezone('utc', now())
 );
+
+alter table public.user_settings add column if not exists language text;
 
 create table if not exists public.document_history (
   id uuid primary key default gen_random_uuid(),

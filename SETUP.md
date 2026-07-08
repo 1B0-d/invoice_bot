@@ -41,6 +41,8 @@ Optional:
 2. Run [supabase/schema.sql](./supabase/schema.sql).
 3. Put `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` into `.env`.
 
+If you already created the tables before the multilingual update, run the SQL again so `user_settings.language` is added.
+
 If Supabase is not configured, user settings fall back to `data/user-settings.json`.
 
 ## R2

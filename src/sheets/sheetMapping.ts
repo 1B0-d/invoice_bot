@@ -76,7 +76,7 @@ export function parseColumnMappingInput(input: string) {
     .filter(Boolean);
 
   if (!lines.length) {
-    throw new Error('Пустой маппинг. Отправь строки в формате supplier=C');
+    throw new Error('Empty mapping. Send lines in the format supplier=C');
   }
 
   const mapping: Partial<Record<InvoiceFieldKey, string>> = {};
@@ -85,15 +85,15 @@ export function parseColumnMappingInput(input: string) {
     const [rawField, rawColumn] = line.split('=').map((part) => part?.trim());
 
     if (!rawField || !rawColumn) {
-      throw new Error(`Неверный формат строки: ${line}`);
+      throw new Error(`Invalid line format: ${line}`);
     }
 
     if (!isValidInvoiceFieldKey(rawField)) {
-      throw new Error(`Неизвестное поле: ${rawField}`);
+      throw new Error(`Unknown field: ${rawField}`);
     }
 
     if (!isValidColumnLetter(rawColumn)) {
-      throw new Error(`Неверная колонка для ${rawField}: ${rawColumn}`);
+      throw new Error(`Invalid column for ${rawField}: ${rawColumn}`);
     }
 
     mapping[rawField] = normalizeColumnLetter(rawColumn);
