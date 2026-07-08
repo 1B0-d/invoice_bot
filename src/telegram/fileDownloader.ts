@@ -1,11 +1,20 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, unlink, writeFile } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
+
+import { uploadOriginalFileToR2 } from '../storage/r2.js';
 
 type TelegramFileClient = {
   telegram: {
     getFileLink(fileId: string): Promise<URL>;
   };
+};
+
+export type DownloadedTelegramFile = {
+  filePath: string;
+  storageKey?: string;
+  storageUrl?: string;
 };
 
 export function sanitizeFilename(filename: string) {
@@ -15,9 +24,12 @@ export function sanitizeFilename(filename: string) {
 export async function downloadTelegramFile(
   bot: TelegramFileClient,
   fileId: string,
-  originalName: string
+  originalName: string,
+  userId: string,
+  mimeType: string
 ) {
-  await mkdir('uploads', { recursive: true });
+  const tempDir = path.join(os.tmpdir(), 'invoice-bot');
+  await mkdir(tempDir, { recursive: true });
 
   const fileUrl = await bot.telegram.getFileLink(fileId);
   const response = await fetch(fileUrl.href);
@@ -29,11 +41,40 @@ export async function downloadTelegramFile(
   const arrayBuffer = await response.arrayBuffer();
   const buffer = Buffer.from(arrayBuffer);
   const safeName = sanitizeFilename(originalName);
-  const filePath = path.join('uploads', `${randomUUID()}_${safeName}`);
+  const filePath = path.join(tempDir, `${randomUUID()}_${safeName}`);
 
   await writeFile(filePath, buffer);
 
-  return filePath;
+  let uploadResult: Awaited<ReturnType<typeof uploadOriginalFileToR2>> | null = null;
+
+  try {
+    uploadResult = await uploadOriginalFileToR2({
+      buffer,
+      contentType: mimeType,
+      fileName: safeName,
+      userId,
+    });
+  } catch (error) {
+    console.error('R2 upload failed, continuing without archive copy:', error);
+  }
+
+  return {
+    filePath,
+    ...(uploadResult?.key ? { storageKey: uploadResult.key } : {}),
+    ...(uploadResult?.url ? { storageUrl: uploadResult.url } : {}),
+  } satisfies DownloadedTelegramFile;
+}
+
+export async function cleanupDownloadedTelegramFile(filePath: string) {
+  try {
+    await unlink(filePath);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+
+    if (code !== 'ENOENT') {
+      throw error;
+    }
+  }
 }
 
 export function detectMimeType(filename: string, fallback?: string) {

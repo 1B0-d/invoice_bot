@@ -1,9 +1,15 @@
 import 'dotenv/config';
+import type { IncomingMessage, ServerResponse } from 'node:http';
+
 import { Markup, session, Telegraf } from 'telegraf';
 import type { Context } from 'telegraf';
 
 import { extractInvoiceFromFile, getAiProvider } from './ai/extractor.js';
 import type { AiProvider, AiRuntimeConfig, ExtractedInvoice, InvoiceRow } from './ai/types.js';
+import {
+  createDocumentHistoryRecord,
+  updateDocumentHistoryRecord,
+} from './history/documentHistory.js';
 import { appendRowToGoogleSheet } from './sheets/googleSheets.js';
 import {
   defaultColumnMapping,
@@ -13,6 +19,7 @@ import {
 import { getUserSettings, updateUserSettings } from './settings/userSettings.js';
 import type { UserSettings } from './settings/userSettings.js';
 import {
+  cleanupDownloadedTelegramFile,
   detectMimeType,
   downloadTelegramFile,
   isSupportedInvoiceFile,
@@ -41,6 +48,12 @@ if (!telegramToken) {
 
 const bot = new Telegraf<BotContext>(telegramToken);
 bot.use(session({ defaultSession: () => ({ awaitingInput: undefined }) }));
+
+const webhookPath = process.env.WEBHOOK_PATH || '/telegram/webhook';
+const webhookSecretToken = process.env.TELEGRAM_WEBHOOK_SECRET;
+const webhookDomain = process.env.WEBHOOK_DOMAIN || process.env.RENDER_EXTERNAL_URL;
+const serverHost = process.env.HOST || '0.0.0.0';
+const serverPort = Number(process.env.PORT || 3000);
 
 function getUserId(ctx: BotContext) {
   const userId = ctx.from?.id;
@@ -246,6 +259,44 @@ async function writeInvoiceRows(
   }
 }
 
+async function safeCreateDocumentHistory(input: {
+  telegramUserId: string;
+  provider: AiProvider;
+  fileName: string;
+  mimeType: string;
+}) {
+  try {
+    return await createDocumentHistoryRecord({
+      ...input,
+      status: 'received',
+    });
+  } catch (error) {
+    console.error('Failed to create document history record:', error);
+    return null;
+  }
+}
+
+async function safeUpdateDocumentHistory(
+  documentHistoryId: string | null,
+  patch: {
+    status?: 'received' | 'processed' | 'failed';
+    errorMessage?: string;
+    extractedInvoice?: ExtractedInvoice;
+    storageKey?: string;
+    storageUrl?: string;
+  }
+) {
+  if (!documentHistoryId) {
+    return;
+  }
+
+  try {
+    await updateDocumentHistoryRecord(documentHistoryId, patch);
+  } catch (error) {
+    console.error('Failed to update document history record:', error);
+  }
+}
+
 async function processInvoiceFile(ctx: BotContext, fileId: string, filename: string, mimeType: string) {
   const userId = getUserId(ctx);
   const settings = await getUserSettings(userId);
@@ -267,78 +318,137 @@ async function processInvoiceFile(ctx: BotContext, fileId: string, filename: str
   }
 
   await ctx.reply(`File received. Downloading and processing with ${provider}...`);
+  const documentHistoryId = await safeCreateDocumentHistory({
+    telegramUserId: userId,
+    provider,
+    fileName: filename,
+    mimeType,
+  });
 
-  const filePath = await downloadTelegramFile(bot, fileId, filename);
-  let invoice: ExtractedInvoice;
+  let filePath: string | null = null;
 
   try {
-    invoice = await extractInvoiceFromFile(filePath, filename, mimeType, runtimeConfig);
-  } catch (error) {
-    const message = String(error);
+    const downloadedFile = await downloadTelegramFile(bot, fileId, filename, userId, mimeType);
+    filePath = downloadedFile.filePath;
 
-    if (message.includes('not configured for this user')) {
-      await ctx.reply(providerSetupError || 'First set your API key in /settings.');
-      return;
+    await safeUpdateDocumentHistory(documentHistoryId, {
+      ...(downloadedFile.storageKey ? { storageKey: downloadedFile.storageKey } : {}),
+      ...(downloadedFile.storageUrl ? { storageUrl: downloadedFile.storageUrl } : {}),
+    });
+
+    let invoice: ExtractedInvoice;
+
+    try {
+      invoice = await extractInvoiceFromFile(filePath, filename, mimeType, runtimeConfig);
+    } catch (error) {
+      const message = String(error);
+
+      if (message.includes('not configured for this user')) {
+        await safeUpdateDocumentHistory(documentHistoryId, {
+          status: 'failed',
+          errorMessage: providerSetupError || 'API key is not configured for this user.',
+        });
+        await ctx.reply(providerSetupError || 'First set your API key in /settings.');
+        return;
+      }
+
+      if (message.includes('"status":"UNAVAILABLE"') || message.includes('high demand')) {
+        await safeUpdateDocumentHistory(documentHistoryId, {
+          status: 'failed',
+          errorMessage: `${provider} is temporarily overloaded.`,
+        });
+        await ctx.reply(
+          `The ${provider} service is temporarily overloaded. Try again later or switch AI provider in /settings.`
+        );
+        return;
+      }
+
+      await safeUpdateDocumentHistory(documentHistoryId, {
+        status: 'failed',
+        errorMessage: message,
+      });
+
+      throw error;
     }
 
-    if (message.includes('"status":"UNAVAILABLE"') || message.includes('high demand')) {
+    if (!invoice.is_invoice) {
+      await safeUpdateDocumentHistory(documentHistoryId, {
+        status: 'failed',
+        errorMessage: `Rejected: detected document type "${invoice.document_type || 'unknown'}".`,
+        extractedInvoice: invoice,
+      });
       await ctx.reply(
-        `The ${provider} service is temporarily overloaded. Try again later or switch AI provider in /settings.`
+        `This does not look like an invoice.\n` +
+          `Document type: ${invoice.document_type || 'unknown'}\n` +
+          `Nothing was written to Google Sheets.`
       );
       return;
     }
 
+    if (invoice.confidence < 0.6) {
+      await safeUpdateDocumentHistory(documentHistoryId, {
+        status: 'failed',
+        errorMessage: `Rejected: confidence ${invoice.confidence} is below threshold.`,
+        extractedInvoice: invoice,
+      });
+      await ctx.reply(
+        `The document was recognized with low confidence.\n` +
+          `Confidence: ${invoice.confidence}\n` +
+          `Nothing was written to Google Sheets.`
+      );
+      return;
+    }
+
+    const validationErrors = validateInvoiceForWrite(invoice);
+
+    if (validationErrors.length > 0) {
+      await safeUpdateDocumentHistory(documentHistoryId, {
+        status: 'failed',
+        errorMessage: validationErrors.join('; '),
+        extractedInvoice: invoice,
+      });
+      await ctx.reply(
+        `I found invoice-like data, but it is not safe to write yet.\n` +
+          `${validationErrors.map((error) => `- ${error}`).join('\n')}`
+      );
+      return;
+    }
+
+    await writeInvoiceRows(invoice.items, invoice, filename, settings);
+    await safeUpdateDocumentHistory(documentHistoryId, {
+      status: 'processed',
+      extractedInvoice: invoice,
+    });
+
+    const preview = invoice.items
+      .slice(0, 5)
+      .map((item) => `- ${item.name}: ${item.quantity} ${item.unit} x ${item.unit_price} ${item.currency}`)
+      .join('\n');
+
+    await ctx.reply(
+      `Done. Rows added to Google Sheets: ${invoice.items.length}\n\n` +
+        `Provider: ${provider}\n` +
+        `Supplier: ${invoice.supplier}\n` +
+        `Date: ${invoice.invoice_date}\n` +
+        `Invoice: ${invoice.invoice_number}\n` +
+        `Sheet ID: ${maskSheetId(spreadsheetId)}\n` +
+        `Sheet name: ${sheetName || 'default'}\n\n` +
+        `${preview}` +
+        (invoice.warnings.length
+          ? `\n\nWarnings:\n${invoice.warnings.map((item) => `- ${item}`).join('\n')}`
+          : '')
+    );
+  } catch (error) {
+    await safeUpdateDocumentHistory(documentHistoryId, {
+      status: 'failed',
+      errorMessage: String(error),
+    });
     throw error;
+  } finally {
+    if (filePath) {
+      await cleanupDownloadedTelegramFile(filePath);
+    }
   }
-
-  if (!invoice.is_invoice) {
-    await ctx.reply(
-      `This does not look like an invoice.\n` +
-        `Document type: ${invoice.document_type || 'unknown'}\n` +
-        `Nothing was written to Google Sheets.`
-    );
-    return;
-  }
-
-  if (invoice.confidence < 0.6) {
-    await ctx.reply(
-      `The document was recognized with low confidence.\n` +
-        `Confidence: ${invoice.confidence}\n` +
-        `Nothing was written to Google Sheets.`
-    );
-    return;
-  }
-
-  const validationErrors = validateInvoiceForWrite(invoice);
-
-  if (validationErrors.length > 0) {
-    await ctx.reply(
-      `I found invoice-like data, but it is not safe to write yet.\n` +
-        `${validationErrors.map((error) => `- ${error}`).join('\n')}`
-    );
-    return;
-  }
-
-  await writeInvoiceRows(invoice.items, invoice, filename, settings);
-
-  const preview = invoice.items
-    .slice(0, 5)
-    .map((item) => `- ${item.name}: ${item.quantity} ${item.unit} x ${item.unit_price} ${item.currency}`)
-    .join('\n');
-
-  await ctx.reply(
-    `Done. Rows added to Google Sheets: ${invoice.items.length}\n\n` +
-      `Provider: ${provider}\n` +
-      `Supplier: ${invoice.supplier}\n` +
-      `Date: ${invoice.invoice_date}\n` +
-      `Invoice: ${invoice.invoice_number}\n` +
-      `Sheet ID: ${maskSheetId(spreadsheetId)}\n` +
-      `Sheet name: ${sheetName || 'default'}\n\n` +
-      `${preview}` +
-      (invoice.warnings.length
-        ? `\n\nWarnings:\n${invoice.warnings.map((item) => `- ${item}`).join('\n')}`
-        : '')
-  );
 }
 
 async function handleTextInput(ctx: BotContext) {
@@ -397,6 +507,36 @@ async function handleTextInput(ctx: BotContext) {
   await updateUserSettings(userId, { openaiApiKey: rawText });
   await showSettingsMenu(ctx, 'OpenAI API key saved.');
   return true;
+}
+
+function sendJson(res: ServerResponse<IncomingMessage>, statusCode: number, payload: Record<string, unknown>) {
+  res.statusCode = statusCode;
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.end(JSON.stringify(payload));
+}
+
+function createWebhookFallbackHandler(path: string) {
+  return (req: IncomingMessage, res: ServerResponse<IncomingMessage>) => {
+    const requestPath = req.url || '/';
+
+    if (req.method === 'GET' && (requestPath === '/' || requestPath === '/healthz')) {
+      sendJson(res, 200, {
+        ok: true,
+        mode: 'webhook',
+        path,
+      });
+      return;
+    }
+
+    if (req.method === 'POST' && requestPath === path) {
+      return;
+    }
+
+    sendJson(res, 404, {
+      ok: false,
+      error: 'Not found',
+    });
+  };
 }
 
 bot.start(async (ctx) => {
@@ -579,8 +719,6 @@ bot.on('photo', async (ctx) => {
   }
 });
 
-console.log(`Invoice bot started with default AI provider: ${getAiProvider()}`);
-
 await bot.telegram.setMyCommands([
   { command: 'start', description: 'Start the bot' },
   { command: 'settings', description: 'Configure AI and spreadsheet' },
@@ -589,7 +727,30 @@ await bot.telegram.setMyCommands([
   { command: 'test', description: 'Test writing to spreadsheet' },
 ]);
 
-bot.launch();
+async function launchBot() {
+  if (webhookDomain) {
+    const webhookConfig = {
+      domain: webhookDomain,
+      path: webhookPath,
+      host: serverHost,
+      port: serverPort,
+      cb: createWebhookFallbackHandler(webhookPath),
+      ...(webhookSecretToken ? { secretToken: webhookSecretToken } : {}),
+    };
+
+    await bot.launch({
+      webhook: webhookConfig,
+    });
+
+    console.log(`Invoice bot started in webhook mode: ${webhookDomain}${webhookPath}`);
+    return;
+  }
+
+  await bot.launch();
+  console.log(`Invoice bot started in polling mode with default AI provider: ${getAiProvider()}`);
+}
+
+await launchBot();
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
